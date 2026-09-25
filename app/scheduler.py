@@ -110,6 +110,37 @@ CANCELLED prerequisite can never complete: dependents stay QUEUED forever
 and ``blocked_by`` (on the job object and in ``GET /queue``) reports the
 prerequisite id together with its current status.
 
+Batch graph submission
+======================
+``POST /jobs/graph`` atomically submits a non-empty *batch* of jobs in one
+request. Every item carries a batch-unique ``ref`` (client-side label), its
+``tenant_id``, ``gpus``, ``duration_min`` and ``weight``, and two
+prerequisite lists: ``depends_on`` names already-existing job ids while
+``depends_on_refs`` names other items' ``ref`` values inside the same batch.
+Forward references (an item depending on an item appearing later in the
+array) are allowed, so the items need not be topologically sorted, and
+external prerequisites may belong to any tenant — dependencies are
+cluster-global exactly as for single submissions. All items belonging to the
+same tenant must agree on ``weight`` (a mismatch rejects the whole batch);
+the agreed weight then creates/updates that tenant once.
+
+Every validation step runs inside the same process-wide lock and
+``BEGIN IMMEDIATE`` write transaction as a single submission: parameter
+shapes, duplicate refs, per-tenant weight agreement, each item's GPU request
+against cluster capacity, the existence of every external job id (a ref that
+matches no item and no existing job is "unknown"), and a cycle check over
+the *whole* would-be graph — existing edges plus every new edge — so the
+batch can never close a cycle (a item naming its own preallocated id or its
+own ref is a self-dependence and rejected as such). Only after every check
+passes are the sequential job ids allocated (in array order), tenants
+upserted, jobs inserted (QUEUED) and dependency edges written; any error
+rolls the entire batch back: no tenants, weights, jobs, edges or queue
+positions change. On success the response maps each ``ref`` to its created
+job id and returns the created job objects (array order). The new jobs are
+ordinary QUEUED jobs immediately: the very next preview or committed batch
+judges their dependencies through the exact same readiness code path as
+single-submitted jobs.
+
 Dependency revision
 ===================
 ``PATCH /jobs/{id}/dependencies`` rewrites a QUEUED job's prerequisite set:
@@ -881,6 +912,245 @@ def _idempotent_replay(
             f"existing job: {record['job_id']}"
         )
     return _get_job_or_404(conn, record["job_id"]), False
+
+
+def submit_job_graph(items: list[dict[str, Any]]) -> dict[str, Any]:
+    """Atomically submit a batch of jobs as one dependency graph.
+
+    Each item is a dict with ``ref`` (unique non-empty label within the
+    batch), ``tenant_id``, ``gpus``, ``duration_min``, ``weight``,
+    ``depends_on`` (existing job ids, any tenant) and ``depends_on_refs``
+    (refs of other items in the same batch). See the module-level
+    "Batch graph submission" section for the full contract: every validation
+    (shapes, unique refs, per-tenant weight agreement, capacity, external
+    references, whole-graph cycles) runs in one ``BEGIN IMMEDIATE``
+    transaction; any failure rolls the whole batch back without touching
+    tenant weights or queues. Success allocates sequential ids in array
+    order, upserts each tenant at the batch-agreed weight, inserts the jobs
+    and every (deduplicated, external + in-batch) edge, and returns
+    ``{"ref_ids": {ref: job_id}, "jobs": [job, ...]}`` in array order.
+    """
+    # ---- Basic shape validation (mirrors a single JobIn/Job submission) ----
+    if not isinstance(items, list) or len(items) == 0:
+        raise SchedulerError("jobs must be a non-empty array")
+
+    norm: list[dict[str, Any]] = []
+    for i, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise SchedulerError(f"jobs[{i}] must be an object")
+        ref = item.get("ref")
+        tenant_id = item.get("tenant_id")
+        gpus = item.get("gpus")
+        duration_min = item.get("duration_min")
+        weight = item.get("weight", 1.0)
+        depends_on = item.get("depends_on", []) or []
+        depends_on_refs = item.get("depends_on_refs", []) or []
+        label = f"jobs[{i}]" + (f" (ref '{ref}')" if isinstance(ref, str) else "")
+
+        if not isinstance(ref, str) or not ref.strip():
+            raise SchedulerError(f"{label}: ref must be a non-empty string")
+        if not isinstance(tenant_id, str) or not tenant_id.strip():
+            raise SchedulerError(f"{label}: tenant_id must be a non-empty string")
+        if not isinstance(gpus, int) or isinstance(gpus, bool) or gpus <= 0:
+            raise SchedulerError(f"{label}: gpus must be a positive integer")
+        if (
+            not isinstance(duration_min, int)
+            or isinstance(duration_min, bool)
+            or duration_min <= 0
+        ):
+            raise SchedulerError(
+                f"{label}: duration_min must be a positive integer"
+            )
+        if not isinstance(weight, (int, float)) or isinstance(weight, bool) \
+                or weight <= 0:
+            raise SchedulerError(f"{label}: weight must be > 0")
+        for field_name, values in (
+            ("depends_on", depends_on),
+            ("depends_on_refs", depends_on_refs),
+        ):
+            if not isinstance(values, list) or any(
+                not isinstance(d, str) or not d.strip() for d in values
+            ):
+                raise SchedulerError(
+                    f"{label}: {field_name} entries must be non-empty strings"
+                )
+        norm.append({
+            "ref": ref,
+            "tenant_id": tenant_id,
+            "gpus": gpus,
+            "duration_min": duration_min,
+            "weight": float(weight),
+            "depends_on": list(depends_on),
+            "depends_on_refs": list(depends_on_refs),
+        })
+
+    settings = get_settings()
+    now = _now_iso()
+    with db.get_lock(), db.get_conn():
+        conn = db.get_conn()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            result = _submit_job_graph_tx(conn, norm, settings, now)
+        except BaseException:
+            # One atomic batch: a failed validation must leave neither
+            # tenant weights nor queue state behind. (With
+            # isolation_level=None the connection context manager does not
+            # roll back on its own.)
+            conn.rollback()
+            raise
+        conn.commit()
+        return result
+
+
+def _submit_job_graph_tx(
+    conn: sqlite3.Connection,
+    norm: list[dict[str, Any]],
+    settings: Settings,
+    now: str,
+) -> dict[str, Any]:
+    """Transaction body of :func:`submit_job_graph`; caller owns commit."""
+    # Refs must be unique within the batch.
+    seen_refs: set[str] = set()
+    for item in norm:
+        if item["ref"] in seen_refs:
+            raise SchedulerError(
+                f"duplicate ref '{item['ref']}' in jobs graph; each ref "
+                "must be unique within the batch"
+            )
+        seen_refs.add(item["ref"])
+
+    # Every item for the same tenant must agree on its weight; the agreed
+    # value is the one tenant weight the batch will create/update to.
+    weight_of: dict[str, float] = {}
+    for item in norm:
+        tid = item["tenant_id"]
+        if tid in weight_of and weight_of[tid] != item["weight"]:
+            raise SchedulerError(
+                f"tenant '{tid}' has inconsistent weights in the same "
+                f"graph: {weight_of[tid]} vs {item['weight']} "
+                f"(ref '{item['ref']}')"
+            )
+        weight_of[tid] = item["weight"]
+
+    # A job that could never run must never be queued, same as POST /jobs.
+    for item in norm:
+        if item["gpus"] > settings.cluster_gpus:
+            raise SchedulerError(
+                f"ref '{item['ref']}' requests {item['gpus']} GPUs which "
+                f"exceeds cluster capacity {settings.cluster_gpus}; it "
+                "could never run"
+            )
+
+    # Allocate the sequential ids up front so prerequisites can mix
+    # in-batch refs with already-existing ids and the graph can be checked
+    # before any row is written. Array order determines both id and FIFO
+    # queue order (identical queued_at, id tie-break).
+    existing_n = conn.execute(
+        "SELECT COUNT(*) AS n FROM jobs"
+    ).fetchone()["n"]
+    for index, item in enumerate(norm):
+        item["job_id"] = f"J{existing_n + index + 1:06d}"
+    id_by_ref = {item["ref"]: item["job_id"] for item in norm}
+
+    # Resolve every prerequisite to a concrete job id. depends_on_refs
+    # names in-batch items (forward/backward refs both allowed);
+    # depends_on names ids that must already exist when the batch commits.
+    prereqs_of: dict[str, list[str]] = {}
+    for item in norm:
+        resolved: list[str] = []
+        for ref in item["depends_on_refs"]:
+            if ref not in id_by_ref:
+                raise SchedulerError(
+                    f"ref '{item['ref']}' depends on unknown batch ref "
+                    f"'{ref}'"
+                )
+            resolved.append(id_by_ref[ref])
+        external = item["depends_on"]
+        if external:
+            placeholders = ",".join("?" for _ in external)
+            found = {
+                r["id"] for r in conn.execute(
+                    f"SELECT id FROM jobs WHERE id IN ({placeholders})",
+                    external,
+                ).fetchall()
+            }
+            missing = [
+                d for d in external
+                if d not in found and d != item["job_id"]
+            ]
+            if missing:
+                raise SchedulerError(
+                    f"ref '{item['ref']}': unknown depends_on job id(s): "
+                    + ", ".join(sorted(set(missing)))
+                )
+            resolved.extend(external)
+        # Same normalised form as a single submission / revision:
+        # deduplicated, sorted by job id.
+        prereqs_of[item["job_id"]] = sorted(set(resolved))
+
+    # Whole-graph cycle check: existing edges plus every new edge. The
+    # existing graph is a DAG by construction; this also catches cycles
+    # contained entirely inside the batch (including self-dependence via
+    # own ref or own preallocated id) and cycles through existing jobs.
+    cycle = _find_cycle(conn, extra_edges=prereqs_of)
+    if cycle is not None:
+        raise SchedulerError(
+            "dependency cycle detected: " + " -> ".join(cycle)
+        )
+
+    # All checks passed: upsert each tenant once at the batch-agreed
+    # weight. As with single submissions this never changes an existing
+    # tenant's max_gpus/budget_gpu_min; it is also the only weight write,
+    # so on rollback nothing about the tenant (or queue) changes.
+    for tenant_id, weight in weight_of.items():
+        if conn.execute(
+            "SELECT 1 FROM tenants WHERE id = ?", (tenant_id,)
+        ).fetchone() is None:
+            conn.execute(
+                """INSERT INTO tenants
+                       (id, weight, deficit, max_gpus, aging_settled_at,
+                        created_at, updated_at)
+                   VALUES (?, ?, 0, NULL, NULL, ?, ?)""",
+                (tenant_id, weight, now, now),
+            )
+        else:
+            conn.execute(
+                "UPDATE tenants SET weight = ?, updated_at = ? WHERE id = ?",
+                (weight, now, tenant_id),
+            )
+
+    # Insert every job before any edge: forward refs mean a prerequisite
+    # item may appear later in the array, and the FOREIGN KEY on
+    # job_dependencies requires both endpoints to already exist.
+    for item in norm:
+        conn.execute(
+            """INSERT INTO jobs
+                   (id, tenant_id, gpus, duration_min, cost_gpu_min,
+                    status, queued_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                item["job_id"], item["tenant_id"], item["gpus"],
+                item["duration_min"],
+                float(item["gpus"] * item["duration_min"]),
+                QUEUED, now,
+            ),
+        )
+    for item in norm:
+        for prereq in prereqs_of[item["job_id"]]:
+            conn.execute(
+                "INSERT INTO job_dependencies (job_id, depends_on) "
+                "VALUES (?, ?)",
+                (item["job_id"], prereq),
+            )
+        # aging_settled_at is intentionally untouched, exactly like a
+        # single submission: non-empty queues keep accruing wait time and
+        # drained queues already carry NULL.
+
+    jobs = [_get_job_or_404(conn, item["job_id"]) for item in norm]
+    return {
+        "ref_ids": {item["ref"]: item["job_id"] for item in norm},
+        "jobs": jobs,
+    }
 
 
 def _get_job_or_404(conn: sqlite3.Connection, job_id: str) -> dict[str, Any]:

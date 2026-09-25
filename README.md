@@ -176,6 +176,88 @@ RUNNING 作业占用 GPU，直到 `complete`/`cancel` 才释放给后续批次�
   - `depends_on`：全部前置作业 id（去重、按 id 排序）；
   - `blocked_by`：尚未 COMPLETED 的前置作业 `[{id, status}]`，仅对 QUEUED 作业有意义，空数组表示立即可调度。
 
+### 批量作业图提交（`POST /jobs/graph`，单事务原子落库）
+
+需要一次提交**多个互相依赖的作业**时，可使用批量作业图接口；整个请求在
+**同一把进程写锁与同一笔 `BEGIN IMMEDIATE` 写事务**内完成全部校验与写入，
+任一错误**整批回滚**，不会改动任何租户权重或队列。
+
+- 请求体含一个**非空作业数组 `jobs`**，每项字段：
+
+  | 字段 | 必填 | 说明 |
+  |---|---|---|
+  | `ref` | 是 | 本批唯一的非空客户端标签，供批内其他作业通过 `depends_on_refs` 引用；响应里返回每个 ref 分配到的作业 id |
+  | `tenant_id` | 是 | 非空租户标识（自动注册/更新租户，规则同 `POST /jobs`，不改动既有 `max_gpus`/`budget_gpu_min`） |
+  | `gpus` | 是 | 所需 GPU 数（正整数，超过 `CLUSTER_GPUS` 整批拒绝） |
+  | `duration_min` | 是 | 预计时长（分钟，正整数） |
+  | `weight` | 是 | 租户权重（> 0）；**同一租户在本批的多项 weight 必须完全一致，否则整批报错** |
+  | `depends_on` | 否 | 引用**已存在作业 id** 的前置列表（跨租户允许），未知 id 整批拒绝 |
+  | `depends_on_refs` | 否 | 引用**本批内其他项 `ref`** 的前置列表；**允许前向引用**（数组无需拓扑排序），引用不存在的 ref 整批拒绝 |
+
+- **依赖语义与单作业提交完全一致**：两个列表合并后去重、按作业 id 排序落库；
+  允许前向及跨租户引用；整图（已有边 + 本批全部新边）做一次**环路校验**，
+  成环（含自依赖）整批拒绝。
+- 校验全部通过后才分配顺序作业 id（**按数组顺序** `J000001, J000002, …`，
+  也是失败回滚后不留 id 空洞的同一计数口径），随后一次性写入租户、作业与全部
+  依赖边（先插入全部作业再写边，因此前向引用不会触发外键问题）。
+- **新作业立刻就是普通 QUEUED 作业**：成功响应返回后，下一次
+  `POST /scheduler/preview` 与 `POST /scheduler/batch` 即按现有依赖判定
+  （`blocked_by`、队首阻塞不发 QUANTUM/老化等）对待它们，无任何额外刷新步骤。
+- 整批失败（重复 ref、同租户 weight 不一致、超容量、未知外部 id / 批内 ref、
+  成环等，均为 **400**；请求体结构错误如空数组/缺字段为 **422**）时：
+  不创建任何租户、不更新任何租户权重（含 `updated_at`）、不创建作业或边、
+  不改变队列，失败批次也**不占用作业 id**。
+
+访问地址（本机）：**`http://localhost:8000/jobs/graph`**（Docker Compose 默认
+把容器 8000 端口映射到本机 **8000**）。
+
+```bash
+# team-a 的 train 依赖批内前向 ref "prep" 与已存在作业 J000001（跨租户）；
+# team-b 的 serve 依赖 train 与 prep
+curl -X POST http://localhost:8000/jobs/graph \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "jobs": [
+      {"ref": "train", "tenant_id": "team-a", "gpus": 2, "duration_min": 10,
+       "weight": 1, "depends_on": ["J000001"], "depends_on_refs": ["prep"]},
+      {"ref": "prep",  "tenant_id": "team-a", "gpus": 1, "duration_min": 5,
+       "weight": 1},
+      {"ref": "serve", "tenant_id": "team-b", "gpus": 1, "duration_min": 5,
+       "weight": 2, "depends_on_refs": ["train", "prep"]}
+    ]
+  }'
+```
+
+```jsonc
+// 201
+{
+  "ref_ids": {"train": "J000002", "prep": "J000003", "serve": "J000004"},
+  "jobs": [
+    {"id": "J000002", "tenant_id": "team-a", "status": "QUEUED",
+     "depends_on": ["J000001", "J000003"],
+     "blocked_by": [{"id": "J000001", "status": "QUEUED"},
+                    {"id": "J000003", "status": "QUEUED"}], ...},
+    {"id": "J000003", "tenant_id": "team-a", "status": "QUEUED",
+     "depends_on": [], "blocked_by": [], ...},
+    {"id": "J000004", "tenant_id": "team-b", "status": "QUEUED",
+     "depends_on": ["J000002", "J000003"], "blocked_by": [...], ...}
+  ]
+}
+```
+
+同租户 weight 不一致会被整批拒绝（且不改动该租户既有权重）：
+
+```bash
+curl -X POST http://localhost:8000/jobs/graph \
+  -H 'Content-Type: application/json' \
+  -d '{"jobs": [
+        {"ref":"a","tenant_id":"team-a","gpus":1,"duration_min":5,"weight":1},
+        {"ref":"b","tenant_id":"team-a","gpus":1,"duration_min":5,"weight":2}
+      ]}'
+# 400 {"error":"tenant 'team-a' has inconsistent weights in the same graph:
+#       1.0 vs 2.0 (ref 'b')"}
+```
+
 ### 排队作业的依赖修订（`PATCH /jobs/{id}/dependencies`）
 
 已入队（**QUEUED**）作业的前置依赖可整体修订：请求体的 `depends_on` 数组
@@ -788,6 +870,7 @@ curl -s -G localhost:8000/jobs/J000001/maintenance-slots \
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | POST | `/jobs` | 提交作业（自动注册/更新租户权重，支持 `depends_on` 依赖）；可选请求头 **`Idempotency-Key`** 实现按 `tenant_id + key` 的幂等提交（首次 201、同参重试 200 返回作业当前对象且无副作用、异参 409、失败不占 key），不传则沿用原接口 |
+| POST | `/jobs/graph` | **批量作业图提交（单事务原子落库）**：非空 `jobs` 数组，每项带本批唯一 `ref`、`tenant_id/gpus/duration_min/weight`，`depends_on` 引已有作业 id、`depends_on_refs` 引批内 ref（允许前向及跨租户引用）；同租户多项 weight 不一致报 400；同事务校验资源参数、外部引用与整图环路后分配顺序 id、写租户/作业/依赖；任一错误整批回滚、不改租户权重或队列；返回 `ref_ids`（ref→id）与作业对象，新作业立即遵循现有预演/正式批次依赖判定 |
 | GET | `/jobs` | 列作业（可选 `status`、`tenant_id`） |
 | GET | `/jobs/{id}` | 作业详情 |
 | PATCH | `/jobs/{id}/dependencies` | **整体替换 QUEUED 作业的前置依赖**（去重排序、空数组解除、跨租户允许；未知 id/自依赖/成环 → 400 且原依赖不变，非 QUEUED → 409）；下一次预演/批次按新依赖判断 |
@@ -900,6 +983,22 @@ curl -s -X POST localhost:8000/jobs -H 'Content-Type: application/json' \
 curl -s -X POST localhost:8000/jobs/J000009/cancel-cascade
 # {"cancelled_count":2,"cancelled":["J000009","J000010"],...}
 curl -s localhost:8000/jobs/J000010                   # status: CANCELLED
+
+# 批量作业图提交（本机 http://localhost:8000）：单事务原子创建一组带前向与
+# 跨租户依赖的作业，返回 ref -> id 映射；任一错误整批回滚、权重与队列不变
+curl -s -X POST localhost:8000/jobs/graph \
+  -H 'Content-Type: application/json' \
+  -d '{"jobs":[
+        {"ref":"prep","tenant_id":"gina","gpus":1,"duration_min":10,"weight":1},
+        {"ref":"train","tenant_id":"gina","gpus":2,"duration_min":20,"weight":1,
+         "depends_on_refs":["prep"]},
+        {"ref":"report","tenant_id":"hank","gpus":1,"duration_min":5,"weight":1,
+         "depends_on_refs":["train"]}
+      ]}'
+# {"ref_ids":{"prep":"J000011","train":"J000012","report":"J000013"},
+#  "jobs":[ {"id":"J000011",...}, {"id":"J000012","depends_on":["J000011"],...},
+#           {"id":"J000013","depends_on":["J000012"],...} ]}
+curl -s -X POST localhost:8000/scheduler/preview     # 新作业立即按现有依赖判定
 ```
 
 ---
@@ -910,7 +1009,7 @@ curl -s localhost:8000/jobs/J000010                   # status: CANCELLED
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements-dev.txt
 
-# 运行全部测试（173 个：服务层算法/依赖/依赖修订/依赖取消级联/用量汇总/租户 GPU 上限/
+# 运行全部测试（198 个：服务层算法/依赖/批量作业图提交/依赖修订/依赖取消级联/用量汇总/租户 GPU 上限/
 # 滚动 24h GPU-分钟预算/批次预演/GPU 维护时段/维护空档查询/POST /jobs 幂等提交 + HTTP 端到端）
 .venv/bin/python -m pytest -q
 
@@ -927,12 +1026,13 @@ CLUSTER_GPUS=8 .venv/bin/python -m uvicorn app.main:app --reload --port 8000
 app/
   config.py       # 环境变量配置
   db.py           # SQLite 连接、schema（tenants/jobs/batches/ledger/job_dependencies/idempotent_jobs/maintenance_windows，含旧库补列迁移）
-  scheduler.py    # 公平排队核心（WDRR + 老化 + 维护时段/空档查询 + 租户上限/24h 预算准入 + 依赖修订 + 依赖取消级联 + 幂等提交，框架无关）
-  main.py         # FastAPI 路由与请求模型（POST /jobs 可选 Idempotency-Key 请求头；PATCH /jobs/{id}/dependencies；GET /jobs/{id}/maintenance-slots；GET /jobs/{id}/cancel-impact 与 POST /jobs/{id}/cancel-cascade）
+  scheduler.py    # 公平排队核心（WDRR + 老化 + 维护时段/空档查询 + 租户上限/24h 预算准入 + 批量作业图提交 + 依赖修订 + 依赖取消级联 + 幂等提交，框架无关）
+  main.py         # FastAPI 路由与请求模型（POST /jobs 可选 Idempotency-Key 请求头；POST /jobs/graph 批量作业图；PATCH /jobs/{id}/dependencies；GET /jobs/{id}/maintenance-slots；GET /jobs/{id}/cancel-impact 与 POST /jobs/{id}/cancel-cascade）
 scripts/
   verify_core.py  # 零依赖核心算法验证
 tests/
   test_scheduler.py    # 算法测试（注入时间，确定性断言）
+  test_job_graph.py    # 批量作业图提交：顺序 id/ref 映射、前向与跨租户引用、同租户 weight 一致性、整图环路、整批回滚不改权重/队列、预演与批次立即生效
   test_budget.py       # 滚动 24h GPU-分钟预算：设置/保留/清除、超额阻塞、窗口滑动、不退费、预演不落库
   test_preview.py      # 预演测试：与正式批次决策一致、零写入、异常回滚
   test_maintenance.py  # 维护时段：持久化/校验、重叠准入、端点相接、RUNNING 不抢占、预演一致

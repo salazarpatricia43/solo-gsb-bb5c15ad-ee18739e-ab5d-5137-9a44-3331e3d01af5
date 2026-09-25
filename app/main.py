@@ -121,6 +121,76 @@ class JobIn(BaseModel):
         return value
 
 
+class GraphJobIn(BaseModel):
+    ref: str = Field(
+        ..., min_length=1,
+        description=(
+            "Client-side label unique within this batch request. Other items "
+            "reference this job through depends_on_refs; the response maps "
+            "each ref to the allocated job id."
+        ),
+        examples=["preprocess"],
+    )
+    tenant_id: str = Field(..., min_length=1, examples=["team-a"])
+    gpus: int = Field(..., gt=0, examples=[2])
+    duration_min: int = Field(..., gt=0, examples=[60])
+    weight: float = Field(
+        ..., gt=0,
+        description=(
+            "Tenant weight. All items of the same tenant in one batch must "
+            "agree on it; the batch auto-registers the tenant or updates it "
+            "exactly once."
+        ),
+        examples=[1.0],
+    )
+    depends_on: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Prerequisite job ids that must already exist (cluster-global; "
+            "cross-tenant allowed) and reach COMPLETED before this job is "
+            "schedulable. To reference another item of the same batch use "
+            "depends_on_refs instead."
+        ),
+        examples=[["J000001"]],
+    )
+    depends_on_refs: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Refs of other items in THIS batch that must COMPLETE first. "
+            "Forward references are allowed (items need not be topologically "
+            "sorted); an unknown ref rejects the whole batch."
+        ),
+        examples=[["preprocess"]],
+    )
+
+    @field_validator("ref")
+    @classmethod
+    def _non_empty_ref(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("ref must be a non-empty string")
+        return value
+
+    @field_validator("depends_on", "depends_on_refs")
+    @classmethod
+    def _non_empty_dependency_ids(cls, value: list[str]) -> list[str]:
+        if any(not isinstance(d, str) or not d.strip() for d in value):
+            raise ValueError("dependency entries must be non-empty strings")
+        return value
+
+
+class JobGraphIn(BaseModel):
+    jobs: list[GraphJobIn] = Field(
+        ..., min_length=1,
+        description=(
+            "Non-empty array of jobs submitted atomically as one dependency "
+            "graph. Any validation failure (duplicate ref, inconsistent "
+            "weights for one tenant, over-capacity GPUs, unknown external "
+            "job id or batch ref, whole-graph cycle) rejects the whole "
+            "batch: no tenant weight, job or queue is changed."
+        ),
+    )
+
+
 class JobDependenciesIn(BaseModel):
     depends_on: list[str] = Field(
         ...,
@@ -284,6 +354,35 @@ def submit_job(
         # object (it may since have been dispatched/completed/cancelled).
         response.status_code = 200
     return job
+
+
+@app.post("/jobs/graph", tags=["jobs"], status_code=201)
+def submit_job_graph(body: JobGraphIn):
+    """Atomically submit a batch of jobs forming one dependency graph.
+
+    Every item carries a batch-unique ``ref`` (client label), its
+    ``tenant_id``, ``gpus``, ``duration_min`` and ``weight``, plus two
+    prerequisite lists: ``depends_on`` names job ids that already exist
+    (cross-tenant allowed) while ``depends_on_refs`` names refs of other
+    items in this same batch — forward references are allowed, so the items
+    need not be topologically sorted. All items for one tenant must agree on
+    ``weight`` (a mismatch rejects the whole batch).
+
+    Parameter shapes, duplicate refs, per-tenant weight agreement, cluster
+    capacity, external job-id existence, in-batch ref existence and a cycle
+    check over the whole would-be graph all run inside one write
+    transaction; any failure rolls the entire batch back with no change to
+    tenant weights or queues. On success the sequential job ids are
+    allocated in array order, tenants are auto-registered/updated once at
+    the agreed weight, and every dependency edge (deduplicated and sorted)
+    is written. Returns the ref→id mapping plus the created job objects;
+    they are ordinary QUEUED jobs, so the next ``/scheduler/preview`` or
+    ``/scheduler/batch`` immediately judges them through the existing
+    dependency readiness path.
+    """
+    return scheduler.submit_job_graph(
+        [item.model_dump() for item in body.jobs]
+    )
 
 
 @app.get("/jobs", tags=["jobs"])
