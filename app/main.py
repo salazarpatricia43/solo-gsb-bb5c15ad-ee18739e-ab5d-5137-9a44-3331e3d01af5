@@ -142,6 +142,82 @@ class JobDependenciesIn(BaseModel):
         return value
 
 
+class GraphJobIn(BaseModel):
+    ref: str = Field(
+        ..., min_length=1,
+        description=(
+            "Client-chosen reference, unique within this batch. Sibling "
+            "items target it via depends_on_refs; the response maps it to "
+            "the assigned job id."
+        ),
+        examples=["extract"],
+    )
+    tenant_id: str = Field(..., min_length=1, examples=["team-a"])
+    gpus: int = Field(..., gt=0, examples=[2])
+    duration_min: int = Field(..., gt=0, examples=[60])
+    weight: float = Field(
+        default=1.0, gt=0,
+        description=(
+            "Tenant weight; auto-registers the tenant or updates it. Every "
+            "item naming the same tenant must declare the same weight."
+        ),
+    )
+    depends_on: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Ids of EXISTING jobs that must reach COMPLETED before this job "
+            "is schedulable (cluster-global; cross-tenant allowed). Use "
+            "depends_on_refs for jobs created by this same request."
+        ),
+        examples=[["J000001"]],
+    )
+    depends_on_refs: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Refs of other items in this batch that must reach COMPLETED "
+            "first. Forward references (to items declared later in the "
+            "array) are allowed."
+        ),
+        examples=[["extract"]],
+    )
+
+    @field_validator("gpus", "duration_min", mode="before")
+    @classmethod
+    def _reject_bool_for_int(cls, value):
+        # Run before Pydantic's bool->int coercion, since JSON booleans must
+        # not be accepted as integer resource parameters.
+        if isinstance(value, bool):
+            raise ValueError("gpus and duration_min must be integers")
+        return value
+
+    @field_validator("depends_on")
+    @classmethod
+    def _non_empty_dependency_ids(cls, value: list[str]) -> list[str]:
+        if any(not isinstance(d, str) or not d.strip() for d in value):
+            raise ValueError("depends_on entries must be non-empty strings")
+        return value
+
+    @field_validator("depends_on_refs")
+    @classmethod
+    def _non_empty_dependency_refs(cls, value: list[str]) -> list[str]:
+        if any(not isinstance(r, str) or not r.strip() for r in value):
+            raise ValueError(
+                "depends_on_refs entries must be non-empty strings"
+            )
+        return value
+
+
+class GraphIn(BaseModel):
+    jobs: list[GraphJobIn] = Field(
+        ..., min_length=1,
+        description=(
+            "Non-empty array of job items. Job ids are assigned in array "
+            "order; the whole graph validates and commits as one "
+            "transaction (any error rolls every item back)."
+        ),
+    )
+
+
 class BatchIn(BaseModel):
     now: datetime | None = Field(
         default=None,
@@ -284,6 +360,30 @@ def submit_job(
         # object (it may since have been dispatched/completed/cancelled).
         response.status_code = 200
     return job
+
+
+@app.post("/jobs/graph", tags=["jobs"], status_code=201)
+def submit_job_graph(body: GraphIn):
+    """Submit a whole dependency graph of jobs in one atomic transaction.
+
+    Each item carries a batch-unique ``ref`` plus the usual job fields and
+    two prerequisite lists: ``depends_on`` (ids of already-existing jobs)
+    and ``depends_on_refs`` (refs of sibling items; forward references are
+    allowed). Dependencies are cluster-global (cross-tenant allowed), and
+    every item naming the same tenant must declare the same ``weight``.
+
+    Resource parameters, external references and the whole-graph cycle
+    check are validated inside the same write transaction that then assigns
+    job ids (in array order) and writes tenants, jobs and dependency edges;
+    any error — duplicate ref, inconsistent weight, unknown id or ref,
+    capacity overflow, dependency cycle — rolls the entire batch back
+    without touching tenant weights or the queue. Returns the ``ref`` ->
+    job id mapping and the created job objects; the new jobs immediately
+    follow the dependency judgement of the next preview or committed batch.
+    """
+    return scheduler.submit_job_graph(
+        [item.model_dump() for item in body.jobs]
+    )
 
 
 @app.get("/jobs", tags=["jobs"])

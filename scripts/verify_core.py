@@ -594,6 +594,63 @@ def main() -> int:
             raise AssertionError("cancelled target should 409")
     print("case 14 dependency cancel cascade OK")
 
+    # --- Case 15: batch job-graph submission -------------------------------
+    db.reset_for_tests()
+    db.connect(":memory:")
+    pre = submit("base", 1, 10, 1.0, iso(0))                 # J000001
+    res = scheduler.submit_job_graph([
+        {"ref": "extract", "tenant_id": "g1", "gpus": 1, "duration_min": 10,
+         "weight": 2.0, "depends_on": [pre["id"]]},
+        {"ref": "train", "tenant_id": "g2", "gpus": 1, "duration_min": 10,
+         "depends_on_refs": ["extract"]},
+        # Chain across tenants: g1's items must keep one consistent weight.
+        {"ref": "eval", "tenant_id": "g1", "gpus": 1, "duration_min": 10,
+         "weight": 2.0, "depends_on_refs": ["train"]},
+    ])
+    assert res["refs"] == {
+        "extract": "J000002", "train": "J000003", "eval": "J000004"}
+    assert [j["depends_on"] for j in res["jobs"]] == [
+        ["J000001"], ["J000002"], ["J000003"]]
+    assert res["jobs"][1]["blocked_by"] == [
+        {"id": "J000002", "status": "QUEUED"}]
+
+    # Conflicting per-tenant weights, cycles and unknown references roll the
+    # whole batch back: no tenant weight, job or dependency edge changes.
+    bad_graphs = [
+        [{"ref": "x", "tenant_id": "g1", "gpus": 1, "duration_min": 5,
+          "weight": 9.0},
+         {"ref": "y", "tenant_id": "g1", "gpus": 1, "duration_min": 5,
+          "weight": 1.0}],
+        [{"ref": "x", "tenant_id": "g1", "gpus": 1, "duration_min": 5,
+          "depends_on_refs": ["y"]},
+         {"ref": "y", "tenant_id": "g1", "gpus": 1, "duration_min": 5,
+          "depends_on_refs": ["x"]}],
+        [{"ref": "x", "tenant_id": "g1", "gpus": 1, "duration_min": 5,
+          "depends_on": ["J000999"]}],
+        [{"ref": "x", "tenant_id": "g1", "gpus": 1, "duration_min": 5,
+          "depends_on_refs": ["ghost"]}],
+    ]
+    for bad in bad_graphs:
+        try:
+            scheduler.submit_job_graph(bad)
+        except scheduler.SchedulerError:
+            pass
+        else:
+            raise AssertionError("invalid graph should be rejected")
+    assert scheduler.get_tenant("g1")["weight"] == 2.0
+    assert db.get_conn().execute(
+        "SELECT COUNT(*) AS n FROM jobs").fetchone()["n"] == 4
+
+    # The new jobs immediately follow preview/batch dependency judgement.
+    p = scheduler.preview_batch(now=at(10))
+    assert p["selection_order"] == ["J000001"], p["selection_order"]
+    r = scheduler.run_batch(now=at(10))
+    assert r["selection_order"] == ["J000001"], r["selection_order"]
+    scheduler.complete_job("J000001")
+    r = scheduler.run_batch(now=at(11))
+    assert r["selection_order"] == ["J000002"], r["selection_order"]
+    print("case 15 batch job-graph submission OK")
+
     print("\nALL CORE CHECKS PASSED")
     return 0
 
